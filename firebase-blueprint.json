@@ -1,0 +1,58 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "name": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "name", "email"]
+    },
+    "Question": {
+      "title": "Question",
+      "description": "Interview question data.",
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "category": { "type": "string", "enum": ["HR", "Technical", "Behavioral", "Aptitude"] },
+        "difficulty": { "type": "string", "enum": ["Easy", "Medium", "Hard"] }
+      },
+      "required": ["text", "category"]
+    },
+    "InterviewResult": {
+      "title": "InterviewResult",
+      "description": "Results of an interview session.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "date": { "type": "string", "format": "date-time" },
+        "category": { "type": "string" },
+        "questions": { "type": "array", "items": { "type": "string" } },
+        "answers": { "type": "array", "items": { "type": "string" } },
+        "scores": { "type": "array", "items": { "type": "number" } },
+        "feedbacks": { "type": "array", "items": { "type": "string" } },
+        "sentiments": { "type": "array", "items": { "type": "string" } },
+        "averageScore": { "type": "number" }
+      },
+      "required": ["userId", "date", "category", "questions", "answers", "scores"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles."
+    },
+    "/questions/{questionId}": {
+      "schema": "Question",
+      "description": "Interview questions pool."
+    },
+    "/results/{resultId}": {
+      "schema": "InterviewResult",
+      "description": "Historical interview results."
+    }
+  }
+}
