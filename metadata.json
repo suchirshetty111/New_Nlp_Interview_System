@@ -1,5 +1,5 @@
 {
   "name": "Smart Interview Bot",
-  "description": "An AI-powered interview practice platform using NLP for real-time feedback and scoring.",
+  "description": "An AI-powered interview practice platform with fast section-based question framing and real-time NLP feedback.",
   "requestFramePermissions": ["microphone"]
 }

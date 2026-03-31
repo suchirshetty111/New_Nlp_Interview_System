@@ -4,6 +4,7 @@ export interface Question {
   id?: string;
   text: string;
   category: InterviewCategory;
+  section?: string;
   difficulty: 'Easy' | 'Medium' | 'Hard';
 }
 

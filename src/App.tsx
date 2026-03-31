@@ -16,7 +16,7 @@ import {
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { auth, db, signInWithGoogle, logout } from './firebase';
 import { Question, InterviewCategory, InterviewSession, EvaluationResult, UserProfile } from './types';
-import { evaluateAnswer, suggestBetterPhrasing, generateQuestions } from './services/gemini';
+import { evaluateAnswer, suggestBetterPhrasing, generateQuestions, generateOverallSummary } from './services/gemini';
 import { VoiceInput } from './components/VoiceInput';
 import { 
   Mic, 
@@ -35,7 +35,9 @@ import {
   PlusCircle,
   FileText,
   Upload,
-  Briefcase
+  Briefcase,
+  Volume2,
+  Clock
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { jsPDF } from 'jspdf';
@@ -127,19 +129,72 @@ export default function App() {
   const [isListening, setIsListening] = useState(false);
   const [history, setHistory] = useState<InterviewSession[]>([]);
   const [loading, setLoading] = useState(true);
+  const [aiSummary, setAiSummary] = useState<{ summary: string; strengths: string[]; improvements: string[] } | null>(null);
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [currentSectionIndex, setCurrentSectionIndex] = useState(0);
+  const [isPreFetching, setIsPreFetching] = useState(false);
+  const [speakingSpeed, setSpeakingSpeed] = useState(1.0);
+  const [interviewTime, setInterviewTime] = useState(0);
+  const [isTimerRunning, setIsTimerRunning] = useState(false);
+
+  // Timer Effect
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (isTimerRunning) {
+      interval = setInterval(() => {
+        setInterviewTime((prev) => prev + 1);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isTimerRunning]);
+
+  // Speak question when it changes
+  useEffect(() => {
+    if (view === 'interview' && questions.length > 0 && questions[currentQuestionIndex]) {
+      speakQuestion(questions[currentQuestionIndex].text);
+    }
+  }, [currentQuestionIndex, view]);
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const INTERVIEW_SECTIONS = [
+    { name: 'Introduction', count: 2 },
+    { name: 'Core Skills', count: 3 },
+    { name: 'Behavioral', count: 3 },
+    { name: 'Closing', count: 2 }
+  ];
 
   // Auth Listener
   useEffect(() => {
+    let historyUnsubscribe: (() => void) | undefined;
+
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setLoading(false);
+      
+      // Clean up previous subscription if it exists
+      if (historyUnsubscribe) {
+        historyUnsubscribe();
+        historyUnsubscribe = undefined;
+      }
+
       if (u) {
         syncUserProfile(u);
-        fetchHistory(u.uid);
+        historyUnsubscribe = fetchHistory(u.uid);
         testConnection(u.uid);
+      } else {
+        setHistory([]);
       }
     });
-    return unsubscribe;
+
+    return () => {
+      unsubscribe();
+      if (historyUnsubscribe) historyUnsubscribe();
+    };
   }, []);
 
   const testConnection = async (uid: string) => {
@@ -150,6 +205,18 @@ export default function App() {
       if (error instanceof Error && error.message.includes('the client is offline')) {
         console.error("Firestore connection test failed: client is offline.");
       }
+    }
+  };
+
+  const handleLogin = async () => {
+    try {
+      await signInWithGoogle();
+    } catch (error: any) {
+      if (error.code === 'auth/popup-closed-by-user') {
+        // Silently ignore if user closed the popup
+        return;
+      }
+      console.error("Login Error:", error);
     }
   };
 
@@ -174,16 +241,20 @@ export default function App() {
   const fetchHistory = (uid: string) => {
     try {
       const q = query(collection(db, 'results'), where('userId', '==', uid));
-      return onSnapshot(q, (snapshot) => {
+      const unsubscribe = onSnapshot(q, (snapshot) => {
         const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as InterviewSession));
-        // Sort manually in memory for now
         const sortedDocs = docs.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
         setHistory(sortedDocs);
       }, (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'results');
+        // Only log if we're still authenticated, otherwise it's expected on logout
+        if (auth.currentUser) {
+          handleFirestoreError(error, OperationType.LIST, 'results');
+        }
       });
+      return unsubscribe;
     } catch (error) {
       handleFirestoreError(error, OperationType.LIST, 'results');
+      return () => {};
     }
   };
 
@@ -223,13 +294,22 @@ export default function App() {
     if (!selectedCategory) return;
     
     setLoading(true);
-    const count = selectedCategory === 'Aptitude' ? 15 : 8;
+    setCurrentSectionIndex(0);
     
-    const generatedQs = await generateQuestions(selectedCategory, count, jobRole, resumeText);
+    // Generate only the first section initially for speed
+    const firstSection = INTERVIEW_SECTIONS[0];
+    const generatedQs = await generateQuestions(
+      selectedCategory, 
+      firstSection.count, 
+      firstSection.name,
+      jobRole, 
+      resumeText
+    );
     
     const formattedQs: Question[] = generatedQs.map(text => ({
       text,
       category: selectedCategory,
+      section: firstSection.name,
       difficulty: 'Medium'
     }));
 
@@ -238,8 +318,61 @@ export default function App() {
     setEvaluations([]);
     setCurrentQuestionIndex(0);
     setCurrentAnswer('');
+    setAiSummary(null);
+    setInterviewTime(0);
+    setIsTimerRunning(true);
     setView('interview');
     setLoading(false);
+
+    // Pre-fetch the next section in the background
+    preFetchNextSection(1, formattedQs);
+  };
+
+  const preFetchNextSection = async (sectionIdx: number, currentQs: Question[]) => {
+    if (sectionIdx >= INTERVIEW_SECTIONS.length || !selectedCategory) return;
+    
+    setIsPreFetching(true);
+    const section = INTERVIEW_SECTIONS[sectionIdx];
+    try {
+      const generatedQs = await generateQuestions(
+        selectedCategory, 
+        section.count, 
+        section.name,
+        jobRole, 
+        resumeText
+      );
+      
+      const formattedQs: Question[] = generatedQs.map(text => ({
+        text,
+        category: selectedCategory,
+        section: section.name,
+        difficulty: 'Medium'
+      }));
+
+      setQuestions([...currentQs, ...formattedQs]);
+      setCurrentSectionIndex(sectionIdx);
+    } catch (error) {
+      console.error("Pre-fetch error:", error);
+    } finally {
+      setIsPreFetching(false);
+    }
+  };
+
+  const speakQuestion = (text: string) => {
+    // Cancel any ongoing speech
+    window.speechSynthesis.cancel();
+    
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = speakingSpeed;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+    
+    // Find a good female voice if available
+    const voices = window.speechSynthesis.getVoices();
+    const preferredVoice = voices.find(v => v.name.includes('Google') || v.name.includes('Female')) || voices[0];
+    if (preferredVoice) utterance.voice = preferredVoice;
+    
+    window.speechSynthesis.speak(utterance);
   };
 
   const handleNextQuestion = async () => {
@@ -261,12 +394,47 @@ export default function App() {
     setCurrentAnswer('');
     setIsEvaluating(false);
 
-    if (currentQuestionIndex < questions.length - 1) {
-      setCurrentQuestionIndex(prev => prev + 1);
+    const nextIndex = currentQuestionIndex + 1;
+    
+    if (nextIndex < questions.length) {
+      setCurrentQuestionIndex(nextIndex);
+      
+      // If we are getting close to the end of currently loaded questions, pre-fetch more
+      // (Though in our 4-section model, we pre-fetch the next section immediately after the previous one starts)
+      const currentSectionEndIndex = questions.length - 1;
+      if (nextIndex === currentSectionEndIndex && currentSectionIndex < INTERVIEW_SECTIONS.length - 1) {
+        preFetchNextSection(currentSectionIndex + 1, questions);
+      }
+    } else if (currentSectionIndex < INTERVIEW_SECTIONS.length - 1) {
+      // If we reached the end but more sections are coming, we might need to wait for pre-fetch
+      setLoading(true);
+      await preFetchNextSection(currentSectionIndex + 1, questions);
+      setLoading(false);
+      setCurrentQuestionIndex(nextIndex);
     } else {
       // Finish Interview
+      setIsTimerRunning(false);
       saveResults(newAnswers, newEvaluations);
       setView('results');
+      handleGenerateSummary(newAnswers, newEvaluations);
+    }
+  };
+
+  const handleGenerateSummary = async (finalAnswers: string[], finalEvaluations: EvaluationResult[]) => {
+    if (!selectedCategory) return;
+    setIsGeneratingSummary(true);
+    try {
+      const summary = await generateOverallSummary(
+        selectedCategory,
+        finalEvaluations,
+        questions.map(q => q.text),
+        finalAnswers
+      );
+      setAiSummary(summary);
+    } catch (error) {
+      console.error("Error generating AI summary:", error);
+    } finally {
+      setIsGeneratingSummary(false);
     }
   };
 
@@ -371,7 +539,7 @@ export default function App() {
           </div>
         ) : (
           <button 
-            onClick={signInWithGoogle}
+            onClick={handleLogin}
             className="bg-indigo-600 text-white px-5 py-2 rounded-full font-medium hover:bg-indigo-700 transition-all shadow-sm"
           >
             Sign In
@@ -400,7 +568,7 @@ export default function App() {
               
               {!user ? (
                 <button 
-                  onClick={signInWithGoogle}
+                  onClick={handleLogin}
                   className="bg-indigo-600 text-white px-8 py-4 rounded-2xl text-lg font-bold hover:bg-indigo-700 transition-all shadow-xl shadow-indigo-200 flex items-center gap-3 mx-auto"
                 >
                   Get Started Free <ChevronRight size={24} />
@@ -521,6 +689,28 @@ export default function App() {
                     <p className="text-xs text-slate-400 mt-2 italic">Note: We'll use your resume to ask personalized questions about your experience.</p>
                   </div>
 
+                  <div>
+                    <label className="block text-sm font-bold text-slate-700 mb-4 flex items-center gap-2">
+                      <Mic size={18} className="text-indigo-600" /> AI Speaking Speed
+                    </label>
+                    <div className="px-2">
+                      <input 
+                        type="range" 
+                        min="0.7" 
+                        max="1.3" 
+                        step="0.3" 
+                        value={speakingSpeed}
+                        onChange={(e) => setSpeakingSpeed(parseFloat(e.target.value))}
+                        className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+                      />
+                      <div className="flex justify-between mt-2 text-xs font-bold text-slate-400 uppercase tracking-wider">
+                        <span className={cn(speakingSpeed === 0.7 && "text-indigo-600")}>Slow</span>
+                        <span className={cn(speakingSpeed === 1.0 && "text-indigo-600")}>Normal</span>
+                        <span className={cn(speakingSpeed === 1.3 && "text-indigo-600")}>Fast</span>
+                      </div>
+                    </div>
+                  </div>
+
                   <button 
                     onClick={startInterview}
                     className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-bold text-lg hover:bg-indigo-700 transition-all shadow-lg shadow-indigo-100 flex items-center justify-center gap-2"
@@ -540,10 +730,70 @@ export default function App() {
               animate={{ opacity: 1 }}
               className="max-w-3xl mx-auto py-12"
             >
+              {/* Progress Indicator */}
+              <div className="mb-10">
+                <div className="flex justify-between items-center mb-4">
+                  <div className="flex gap-2">
+                    {INTERVIEW_SECTIONS.map((section, idx) => {
+                      const isCurrent = questions[currentQuestionIndex]?.section === section.name;
+                      const isCompleted = INTERVIEW_SECTIONS.findIndex(s => s.name === questions[currentQuestionIndex]?.section) > idx;
+                      
+                      return (
+                        <div key={section.name} className="flex flex-col items-center">
+                          <div className={cn(
+                            "h-1.5 w-16 rounded-full transition-all duration-500",
+                            isCompleted ? "bg-emerald-500" : isCurrent ? "bg-indigo-600" : "bg-slate-200"
+                          )} />
+                          <span className={cn(
+                            "text-[10px] font-bold mt-1 uppercase tracking-tighter",
+                            isCurrent ? "text-indigo-600" : "text-slate-400"
+                          )}>
+                            {section.name}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="text-right flex items-center gap-6">
+                    <div className="flex flex-col items-end">
+                      <span className="text-xs font-bold text-slate-400 uppercase">Session Time</span>
+                      <div className="flex items-center gap-2 text-indigo-600 font-mono font-bold">
+                        <Clock size={14} />
+                        <span>{formatTime(interviewTime)}</span>
+                      </div>
+                    </div>
+                    <div className="flex flex-col items-end">
+                      <span className="text-xs font-bold text-slate-400 uppercase">Overall Progress</span>
+                      <div className="flex items-center gap-2">
+                        <div className="h-2 w-24 bg-slate-100 rounded-full overflow-hidden">
+                          <motion.div 
+                            className="h-full bg-indigo-600"
+                            initial={{ width: 0 }}
+                            animate={{ width: `${((currentQuestionIndex) / 10) * 100}%` }}
+                          />
+                        </div>
+                        <span className="text-sm font-bold text-slate-700">{Math.round(((currentQuestionIndex) / 10) * 100)}%</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="mb-8 flex justify-between items-end">
                 <div>
-                  <span className="text-sm font-bold text-indigo-600 uppercase tracking-widest">Question {currentQuestionIndex + 1} of {questions.length}</span>
-                  <h2 className="text-3xl font-bold mt-2">{questions[currentQuestionIndex].text}</h2>
+                  <span className="text-sm font-bold text-indigo-600 uppercase tracking-widest">
+                    {questions[currentQuestionIndex].section || 'Interview'} • Question {currentQuestionIndex + 1}
+                  </span>
+                  <div className="flex items-start gap-4 mt-2">
+                    <h2 className="text-3xl font-bold">{questions[currentQuestionIndex].text}</h2>
+                    <button 
+                      onClick={() => speakQuestion(questions[currentQuestionIndex].text)}
+                      className="p-2 text-indigo-600 hover:bg-indigo-50 rounded-full transition-all"
+                      title="Repeat Question"
+                    >
+                      <Volume2 size={24} />
+                    </button>
+                  </div>
                 </div>
                 <div className="bg-white px-4 py-2 rounded-full border border-slate-200 text-sm font-medium text-slate-500">
                   {selectedCategory}
@@ -647,6 +897,74 @@ export default function App() {
                 </div>
               </div>
 
+              {/* AI Overall Summary */}
+              <div className="bg-white rounded-3xl p-10 shadow-xl border border-slate-100 mb-8">
+                <div className="flex items-center gap-3 mb-6">
+                  <div className="p-2 bg-indigo-50 rounded-lg text-indigo-600">
+                    <BrainCircuit size={24} />
+                  </div>
+                  <h3 className="text-2xl font-bold text-slate-800">AI Performance Summary</h3>
+                </div>
+
+                {isGeneratingSummary ? (
+                  <div className="py-12 flex flex-col items-center justify-center gap-4 text-slate-400">
+                    <motion.div 
+                      animate={{ rotate: 360 }} 
+                      transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+                    >
+                      <BrainCircuit size={48} className="text-indigo-200" />
+                    </motion.div>
+                    <p className="font-medium animate-pulse">Analyzing your overall performance...</p>
+                  </div>
+                ) : aiSummary ? (
+                  <div className="space-y-8">
+                    <p className="text-lg text-slate-600 leading-relaxed border-l-4 border-indigo-500 pl-6 py-2 bg-indigo-50/30 rounded-r-xl">
+                      {aiSummary.summary}
+                    </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                      <div className="bg-emerald-50/50 p-6 rounded-2xl border border-emerald-100">
+                        <h4 className="text-emerald-700 font-bold flex items-center gap-2 mb-4">
+                          <CheckCircle2 size={20} /> Key Strengths
+                        </h4>
+                        <ul className="space-y-3">
+                          {aiSummary.strengths.map((strength, idx) => (
+                            <li key={idx} className="text-slate-700 flex items-start gap-3">
+                              <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 mt-2 shrink-0" />
+                              {strength}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+
+                      <div className="bg-amber-50/50 p-6 rounded-2xl border border-amber-100">
+                        <h4 className="text-amber-700 font-bold flex items-center gap-2 mb-4">
+                          <AlertCircle size={20} /> Areas for Improvement
+                        </h4>
+                        <ul className="space-y-3">
+                          {aiSummary.improvements.map((improvement, idx) => (
+                            <li key={idx} className="text-slate-700 flex items-start gap-3">
+                              <div className="w-1.5 h-1.5 rounded-full bg-amber-400 mt-2 shrink-0" />
+                              {improvement}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="py-8 text-center text-slate-400">
+                    <p>Summary could not be generated.</p>
+                    <button 
+                      onClick={() => handleGenerateSummary(answers, evaluations)}
+                      className="mt-4 text-indigo-600 font-bold hover:underline"
+                    >
+                      Retry Analysis
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <div className="space-y-6">
                 {questions.map((q, i) => (
                   <div key={i} className="bg-white rounded-3xl p-8 border border-slate-100 shadow-sm">
@@ -734,7 +1052,9 @@ export default function App() {
                             setAnswers(session.answers);
                             setEvaluations(session.evaluations);
                             setSelectedCategory(session.category);
+                            setAiSummary(null);
                             setView('results');
+                            handleGenerateSummary(session.answers, session.evaluations);
                           }}
                           className="p-3 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-xl transition-all"
                           title="View Details"
@@ -786,8 +1106,20 @@ export default function App() {
                 <h3 className="text-xl font-bold mb-6">Recent Activity</h3>
                 <div className="space-y-4">
                   {history.slice(0, 5).map((session, i) => (
-                    <div key={i} className="flex items-center gap-4 p-4 hover:bg-slate-50 rounded-2xl transition-colors">
-                      <div className="w-12 h-12 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
+                    <div 
+                      key={i} 
+                      className="flex items-center gap-4 p-4 hover:bg-slate-50 rounded-2xl transition-colors cursor-pointer group"
+                      onClick={() => {
+                        setQuestions(session.questions.map(q => ({ text: q, category: session.category, difficulty: 'Medium' })));
+                        setAnswers(session.answers);
+                        setEvaluations(session.evaluations);
+                        setSelectedCategory(session.category);
+                        setAiSummary(null);
+                        setView('results');
+                        handleGenerateSummary(session.answers, session.evaluations);
+                      }}
+                    >
+                      <div className="w-12 h-12 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0 group-hover:bg-indigo-600 group-hover:text-white transition-colors">
                         <CheckCircle2 size={24} />
                       </div>
                       <div className="flex-1">

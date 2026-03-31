@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import { EvaluationResult } from "../types";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
@@ -88,41 +88,48 @@ export const suggestBetterPhrasing = async (answer: string): Promise<string> => 
 export const generateQuestions = async (
   category: string, 
   count: number, 
+  section: string,
   jobRole?: string, 
   resumeText?: string
 ): Promise<string[]> => {
   const model = "gemini-3-flash-preview";
   
   const prompt = `
-    You are an expert interviewer. Generate ${count} high-quality interview questions for a ${category} interview.
+    You are an expert interviewer. Your task is to generate ${count} high-quality interview questions specifically for the "${section}" stage of a ${category} interview.
     
     Context:
     ${jobRole ? `- Target Job Role: ${jobRole}` : ""}
     ${resumeText ? `- Candidate's Resume Content: ${resumeText}` : ""}
     
-    Instructions:
-    1. If a resume is provided:
-       - Parse it for key technical/soft skills, specific past projects, and quantifiable achievements (e.g., "increased revenue by 20%", "managed a team of 10").
-       - Generate at least 50-60% of the questions based directly on these resume details. 
-       - Ask deep-dive questions about their role in specific projects mentioned.
-       - Ask how they applied their listed skills to solve real-world problems.
-       - Specifically for HR rounds, ask how their background and skills align with the target job role's culture and requirements.
-    2. If a job role is provided:
-       - Ensure questions are relevant to the seniority and technical requirements of that role.
-       - Ask how their past experiences prepare them for the challenges of this specific role.
-    3. General Category Questions:
-       - The remaining questions should be standard but challenging ${category} questions.
-       - For HR: focus on cultural fit, conflict resolution, career aspirations, and work ethic.
-    4. Diversity:
-       - Ensure a mix of situational, technical (if applicable), and behavioral questions.
+    Interview Stage: ${section}
     
-    Return the questions as a JSON array of strings.
+    Instructions for this specific stage:
+    1. Introduction Stage:
+       - Focus on breaking the ice, understanding the candidate's journey, and their motivation for the role.
+       - Ask about their "elevator pitch" and how their background led them here.
+    2. Core Skills Stage:
+       - Dive deep into technical or functional competencies required for the ${jobRole || category} role.
+       - If a resume is provided, ask about specific technologies, methodologies, or projects listed.
+       - Focus on "how" and "why" they made certain decisions in their work.
+    3. Behavioral Stage:
+       - Use the STAR method (Situation, Task, Action, Result) to frame questions.
+       - Focus on soft skills: leadership, conflict resolution, adaptability, and teamwork.
+       - Ask for specific examples from their past experience.
+    4. Closing Stage:
+       - Focus on long-term career alignment, cultural fit, and their interest in this specific company/role.
+       - Ask what they are looking for in their next challenge.
+    
+    General Guidelines:
+    - Ensure questions are challenging but fair.
+    - If a resume is provided, tailor at least 60% of the questions to the candidate's specific experience.
+    - Return the questions as a JSON array of strings.
   `;
 
   const response = await ai.models.generateContent({
     model,
     contents: prompt,
     config: {
+      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       responseMimeType: "application/json",
       responseSchema: {
         type: Type.ARRAY,
@@ -136,5 +143,64 @@ export const generateQuestions = async (
   } catch (error) {
     console.error("Failed to parse generated questions:", error);
     return [];
+  }
+};
+
+export const generateOverallSummary = async (
+  category: string,
+  evaluations: EvaluationResult[],
+  questions: string[],
+  answers: string[]
+): Promise<{ summary: string; strengths: string[]; improvements: string[] }> => {
+  const model = "gemini-3-flash-preview";
+  
+  const interviewData = questions.map((q, i) => ({
+    question: q,
+    answer: answers[i],
+    score: evaluations[i].score,
+    feedback: evaluations[i].feedback,
+    suggestions: evaluations[i].suggestions
+  }));
+
+  const prompt = `
+    Based on the following interview session results for a ${category} round, provide a comprehensive summary of the candidate's performance.
+    
+    Interview Data:
+    ${JSON.stringify(interviewData, null, 2)}
+    
+    Instructions:
+    1. Provide a concise overall summary of the performance (2-3 sentences).
+    2. Highlight 3-4 key strengths observed across all answers.
+    3. Identify 3-4 specific areas for improvement.
+    
+    Return the response as a JSON object.
+  `;
+
+  const response = await ai.models.generateContent({
+    model,
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          summary: { type: Type.STRING },
+          strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+          improvements: { type: Type.ARRAY, items: { type: Type.STRING } }
+        },
+        required: ["summary", "strengths", "improvements"]
+      }
+    }
+  });
+
+  try {
+    return JSON.parse(response.text || "{}");
+  } catch (error) {
+    console.error("Failed to parse overall summary:", error);
+    return {
+      summary: "Could not generate summary.",
+      strengths: [],
+      improvements: []
+    };
   }
 };
